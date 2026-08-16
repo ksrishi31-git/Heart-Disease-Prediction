@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+heartguard.db
+test_heartguard.db
+models/
+encrypted_models/
+tests/
+explore_data.py
+smoke_test.py
