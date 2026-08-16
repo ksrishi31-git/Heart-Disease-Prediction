@@ -229,6 +229,88 @@ def feature_importance_for(pipeline: Pipeline) -> dict:
     }
 
 
+def train_single_model(config: dict, X_train, y_train, X_test, y_test) -> dict:
+    """Run the full standard pipeline for a single model configuration.
+
+    Shared by the offline comparison training (``train()``) and the
+    production startup preparation (``app.ml.ensure_model``), so the
+    Logistic Regression production model is trained with exactly the same
+    pipeline, preprocessing, tuning and CV-based selection.
+    """
+    settings = get_settings()
+    key = config["key"]
+    print(f"\n{'=' * 60}\nTraining {config['human_name']}\n{'=' * 60}")
+
+    baseline_pipe = build_model_pipeline(default_estimator(config))
+    baseline_cv = cross_validate(baseline_pipe, X_train, y_train, CV)
+    print(f"Baseline CV (defaults): ROC-AUC {baseline_cv['roc_auc']['mean']:.4f} "
+          f"+/- {baseline_cv['roc_auc']['std']:.4f} | "
+          f"accuracy {baseline_cv['accuracy']['mean']:.4f} | "
+          f"sensitivity {baseline_cv['recall']['mean']:.4f} | "
+          f"specificity {baseline_cv['specificity']['mean']:.4f}")
+
+    imbalance_report = compare_class_weight(config, X_train, y_train)
+
+    best_params, search = tune_hyperparameters(config, X_train, y_train)
+    estimator = build_final_estimator(config, best_params)
+
+    tuned_pipe = build_model_pipeline(estimator)
+    final_cv = cross_validate(tuned_pipe, X_train, y_train, CV)
+    print(f"Tuned CV: ROC-AUC {final_cv['roc_auc']['mean']:.4f} +/- "
+          f"{final_cv['roc_auc']['std']:.4f} | "
+          f"accuracy {final_cv['accuracy']['mean']:.4f} | "
+          f"sensitivity {final_cv['recall']['mean']:.4f} | "
+          f"specificity {final_cv['specificity']['mean']:.4f}")
+
+    use_selection, selection_report = compare_feature_selection(
+        config, estimator, X_train, y_train)
+
+    final_pipeline = build_final_pipeline(config, estimator, use_selection)
+    final_pipeline.fit(X_train, y_train)
+    y_proba = final_pipeline.predict_proba(X_test)[:, 1]
+    y_pred = final_pipeline.predict(X_test)
+    metrics = compute_metrics(y_test, y_pred, y_proba)
+    metrics["feature_importance"] = feature_importance_for(final_pipeline)
+    metrics["hyperparameters"] = best_params
+    metrics["cv"] = {
+        metric: {"mean": values["mean"], "std": values["std"]}
+        for metric, values in final_cv.items()
+    }
+    metrics["cv"]["selection"] = selection_report
+    print(f"\nFINAL TEST-SET ({config['human_name']}):")
+    print(f"  Accuracy: {metrics['accuracy']} | Precision: {metrics['precision']} | "
+          f"Sensitivity: {metrics['recall']} | Specificity: {metrics['specificity']} | "
+          f"F1: {metrics['f1']} | ROC-AUC: {metrics['roc_auc']}")
+    print(f"  Confusion matrix: {metrics['confusion_matrix']}")
+
+    feature_names = get_feature_names(final_pipeline)
+
+    buffer = io.BytesIO()
+    joblib.dump(final_pipeline, buffer)
+    encrypted = encrypt_bytes(buffer.getvalue())
+    out_path = settings.ENCRYPTED_MODELS_DIR / f"{key}.enc"
+    out_path.write_bytes(encrypted)
+    saved_entry = {
+        "key": key,
+        "human_name": config["human_name"],
+        "algorithm": config["estimator_cls"].__name__,
+        "path": str(out_path.relative_to(settings.ENCRYPTED_MODELS_DIR)),
+        "encrypted": True,
+    }
+    print(f"  Encrypted pipeline saved -> {out_path.name}")
+
+    return {
+        "key": key,
+        "human_name": config["human_name"],
+        "feature_names": feature_names,
+        "metrics": metrics,
+        "cv_report": final_cv,
+        "imbalance_report": imbalance_report,
+        "selection_report": selection_report,
+        "saved_entry": saved_entry,
+    }
+
+
 def train() -> dict:
     settings = get_settings()
     df, raw_rows = load_dataset(settings.DATASET_PATH)
@@ -250,69 +332,15 @@ def train() -> dict:
     selection_reports: dict[str, dict] = {}
 
     for config in MODEL_CONFIGS:
-        key = config["key"]
-        print(f"\n{'=' * 60}\nTraining {config['human_name']}\n{'=' * 60}")
-
-        baseline_pipe = build_model_pipeline(default_estimator(config))
-        baseline_cv = cross_validate(baseline_pipe, X_train, y_train, CV)
-        print(f"Baseline CV (defaults): ROC-AUC {baseline_cv['roc_auc']['mean']:.4f} "
-              f"+/- {baseline_cv['roc_auc']['std']:.4f} | "
-              f"accuracy {baseline_cv['accuracy']['mean']:.4f} | "
-              f"sensitivity {baseline_cv['recall']['mean']:.4f} | "
-              f"specificity {baseline_cv['specificity']['mean']:.4f}")
-
-        imbalance_reports[key] = compare_class_weight(config, X_train, y_train)
-
-        best_params, search = tune_hyperparameters(config, X_train, y_train)
-        estimator = build_final_estimator(config, best_params)
-
-        tuned_pipe = build_model_pipeline(estimator)
-        final_cv = cross_validate(tuned_pipe, X_train, y_train, CV)
-        cv_reports[key] = final_cv
-        print(f"Tuned CV: ROC-AUC {final_cv['roc_auc']['mean']:.4f} +/- "
-              f"{final_cv['roc_auc']['std']:.4f} | "
-              f"accuracy {final_cv['accuracy']['mean']:.4f} | "
-              f"sensitivity {final_cv['recall']['mean']:.4f} | "
-              f"specificity {final_cv['specificity']['mean']:.4f}")
-
-        use_selection, selection_reports[key] = compare_feature_selection(
-            config, estimator, X_train, y_train)
-
-        final_pipeline = build_final_pipeline(config, estimator, use_selection)
-        final_pipeline.fit(X_train, y_train)
-        y_proba = final_pipeline.predict_proba(X_test)[:, 1]
-        y_pred = final_pipeline.predict(X_test)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["feature_importance"] = feature_importance_for(final_pipeline)
-        metrics["hyperparameters"] = best_params
-        metrics["cv"] = {
-            metric: {"mean": values["mean"], "std": values["std"]}
-            for metric, values in final_cv.items()
-        }
-        metrics["cv"]["selection"] = selection_reports[key]
-        all_metrics[key] = metrics
-        print(f"\nFINAL TEST-SET ({config['human_name']}):")
-        print(f"  Accuracy: {metrics['accuracy']} | Precision: {metrics['precision']} | "
-              f"Sensitivity: {metrics['recall']} | Specificity: {metrics['specificity']} | "
-              f"F1: {metrics['f1']} | ROC-AUC: {metrics['roc_auc']}")
-        print(f"  Confusion matrix: {metrics['confusion_matrix']}")
-
+        result = train_single_model(config, X_train, y_train, X_test, y_test)
+        key = result["key"]
+        all_metrics[key] = result["metrics"]
+        cv_reports[key] = result["cv_report"]
+        imbalance_reports[key] = result["imbalance_report"]
+        selection_reports[key] = result["selection_report"]
+        saved_models.append(result["saved_entry"])
         if not feature_names:
-            feature_names = get_feature_names(final_pipeline)
-
-        buffer = io.BytesIO()
-        joblib.dump(final_pipeline, buffer)
-        encrypted = encrypt_bytes(buffer.getvalue())
-        out_path = settings.ENCRYPTED_MODELS_DIR / f"{key}.enc"
-        out_path.write_bytes(encrypted)
-        saved_models.append({
-            "key": key,
-            "human_name": config["human_name"],
-            "algorithm": config["estimator_cls"].__name__,
-            "path": str(out_path.relative_to(settings.ENCRYPTED_MODELS_DIR)),
-            "encrypted": True,
-        })
-        print(f"  Encrypted pipeline saved -> {out_path.name}")
+            feature_names = result["feature_names"]
 
     print("\n" + format_metrics_table(all_metrics))
     print("\nThe application uses Logistic Regression as its single prediction"

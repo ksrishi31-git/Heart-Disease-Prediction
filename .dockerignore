@@ -25,4 +25,5 @@ nginx/
 backend/tests/
 backend/explore_data.py
 backend/smoke_test.py
-heart.csv
+# Root-level copy only — never exclude the training dataset under backend/datasets/
+/heart.csv

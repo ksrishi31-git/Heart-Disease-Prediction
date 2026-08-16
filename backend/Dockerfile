@@ -28,4 +28,7 @@ WORKDIR /app/backend
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m app.ml.train && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Production startup: prepare ONLY the Logistic Regression model (fast, skipped
+# when logistic_regression.enc already exists), then start FastAPI immediately.
+# Uvicorn binds to Render's PORT environment variable; 8000 is only a fallback.
+CMD ["sh", "-c", "python -m app.ml.ensure_model && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

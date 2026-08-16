@@ -29,8 +29,10 @@ Internet → HTTPS (443) → Nginx → FastAPI (:8000) → PostgreSQL
    ```
 
    - `db` — PostgreSQL 16 (data in a named volume).
-   - `backend` — trains the models on first start (if missing), applies
-     Alembic migrations, serves FastAPI on :8000.
+   - `backend` — prepares the Logistic Regression model on first start
+     (only if `logistic_regression.enc` is missing — Decision Tree and
+     Random Forest are never trained at startup), applies Alembic
+     migrations, serves FastAPI on :8000.
    - `frontend` — Nginx serving the React build on :8080, proxying
      `/api` → backend.
 
@@ -76,8 +78,18 @@ Steps:
 
 1. Build the frontend (`npm run build`) and deploy `dist/` to your static
    host. Set `VITE_API_URL` to the public API URL.
-2. Deploy the backend with a start command such as
-   `python -m app.ml.train && uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+2. Deploy the backend with the production start command
+   (used by `backend/Dockerfile`), which prepares only the Logistic
+   Regression model when needed and then starts FastAPI on the platform's
+   `PORT`:
+
+   ```bash
+   python -m app.ml.ensure_model && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+   ```
+
+   Do **not** run `python -m app.ml.train` at startup — it trains Decision
+   Tree and Random Forest too, which delays the port from opening and
+   causes startup timeouts on platforms like Render.
 3. Point `DATABASE_URL` at the managed PostgreSQL.
 4. Put `ENCRYPTION_KEY`, `JWT_SECRET_KEY` and `AUDIT_SALT` into the
    platform's secret store (or a KMS-backed secret manager), and have the
